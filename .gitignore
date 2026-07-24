@@ -170,3 +170,10 @@ icon_request_*/
 icon_request_*.zip
 
 app/gradle.properties
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
