@@ -51,9 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("status", "resolve", "apply"),
+        choices=("status", "resolve", "apply", "prune"),
         default="status",
-        help="Operation to run (status, resolve, apply). Defaults to status.",
+        help="Operation to run (status, resolve, apply, prune). Defaults to status.",
     )
     parser.add_argument(
         "--request-dir",
@@ -661,6 +661,48 @@ def apply_requests(new_items: List[RequestItem], repo_root: Path, dry_run: bool)
         print(f"Appended {len(theme_additions)} lines to theme_resources.xml.")
 
 
+def prune_requests(request_dir: Path, existing_drawables: Set[str], dry_run: bool) -> None:
+    """Remove image files from the request folder that are already in the app."""
+    print("\n" + "=" * 70)
+    print(" PRUNE EXISTING IMAGES")
+    print(" Removing image files that are already added to the app.")
+    print("=" * 70)
+
+    to_prune = []
+    for child in sorted(request_dir.iterdir()):
+        if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
+            try:
+                name = ensure_safe_name(child.stem)
+            except ValueError:
+                continue
+            if name in existing_drawables:
+                to_prune.append((child, name))
+
+    if not to_prune:
+        print("\nNo existing images to prune.")
+        return
+
+    print(f"\nFound {len(to_prune)} image(s) that already exist in the app:")
+    for f, name in to_prune:
+        print(f"  - {f.name} (drawable: {name})")
+
+    if dry_run:
+        print("\n[dry-run] Would delete these files.")
+        return
+
+    try:
+        answer = input("\nDelete these images? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nSkipping prune.")
+        return
+
+    if answer == "y":
+        for f, name in to_prune:
+            f.unlink()
+            print(f"  Deleted: {f.name}")
+        print("\nPruned existing images from request folder.")
+
+
 def main() -> int:
     """Run the request manager CLI."""
     args = parse_args()
@@ -694,6 +736,8 @@ def main() -> int:
         )
     elif args.command == "apply":
         apply_requests(summary[RequestStatus.NEW], repo_root, args.dry_run)
+    elif args.command == "prune":
+        prune_requests(request_dir, existing_drawables, args.dry_run)
 
     return 0
 
