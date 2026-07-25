@@ -15,7 +15,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-IMAGE_EXTENSIONS = (".png", ".webp", ".svg")
+# SVG is not a valid Android drawable-nodpi resource; only raster formats here.
+IMAGE_EXTENSIONS = (".png", ".webp")
 
 
 class RequestStatus(Enum):
@@ -71,64 +72,81 @@ def parse_args() -> argparse.Namespace:
 
 
 def find_repo_root(specified_root: Optional[str]) -> Path:
-    """Determine the repository root directory."""
+    """Determine the repository root directory, validating it contains app resources."""
     if specified_root:
         root = Path(specified_root).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"Specified repo root directory not found: {root}")
-        return root
+    else:
+        script_dir = Path(__file__).resolve().parent
+        candidates = [
+            script_dir.parent,
+            Path.cwd().resolve(),
+            Path.cwd().resolve().parent,
+        ]
+        root = None
+        for candidate in candidates:
+            if (candidate / "app" / "src" / "main" / "res").is_dir():
+                root = candidate
+                break
+        if root is None:
+            raise FileNotFoundError(
+                "Could not locate the Cuscon repo root. "
+                "Ensure you run this from the repo, or use --repo-root."
+            )
 
-    script_dir = Path(__file__).resolve().parent
-    if (script_dir.parent / "app").is_dir():
-        return script_dir.parent
-
-    cwd = Path.cwd().resolve()
-    if (cwd / "app").is_dir():
-        return cwd
-    if (cwd.parent / "app").is_dir():
-        return cwd.parent
-
-    return script_dir.parent
+    # Final validation
+    res_dir = root / "app" / "src" / "main" / "res"
+    if not res_dir.is_dir():
+        raise FileNotFoundError(
+            f"Path '{root}' does not look like the Cuscon repo root "
+            f"(missing {res_dir}). Use --repo-root to specify the correct path."
+        )
+    return root
 
 
 def find_request_dir(request_dir_arg: Optional[str], repo_root: Path) -> Path:
-    """Locate the request folder using fallback search order."""
+    """Locate the request folder."""
     if request_dir_arg:
         request_dir = Path(request_dir_arg).expanduser().resolve()
         if not request_dir.is_dir():
             raise FileNotFoundError(f"Request directory not found: {request_dir}")
         return request_dir
 
-    candidates = [
-        repo_root / "requests" / "icon_request",
-        repo_root / "requests" / "icon_request_",
-        repo_root / "icon_request",
-        repo_root / "icon_request_",
-    ]
-
-    cwd = Path.cwd().resolve()
-    if cwd.name in ("icon_request", "icon_request_") and cwd.is_dir():
-        return cwd
-
-    candidates.extend([cwd / "icon_request", cwd / "icon_request_"])
-
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
+    # Default: repo_root/requests/icon_request
+    default = repo_root / "requests" / "icon_request"
+    if default.is_dir():
+        return default
 
     raise FileNotFoundError(
-        "Could not locate an icon_request folder. Use --request-dir to specify the request directory."
+        "Could not locate an icon_request folder. "
+        "Use --request-dir to specify the request directory."
     )
 
 
-def load_text_lines(path: Path) -> List[str]:
-    """Load text lines from a file, returning empty list if missing."""
+def load_text_lines(path: Path) -> Tuple[List[str], str]:
+    """Load text lines and detected line ending.
+
+    Returns:
+        Tuple of (lines, line_ending). Lines have no trailing newline characters.
+    """
     if not path.exists():
-        return []
-    try:
-        return path.read_text(encoding="utf-8").splitlines()
-    except UnicodeDecodeError:
-        return path.read_text(encoding="latin-1").splitlines()
+        return [], "\n"
+    data = path.read_bytes()
+    if b"\r\n" in data:
+        ending = "\r\n"
+    else:
+        ending = "\n"
+    text = data.decode("utf-8")
+    # Split keeping the ending for accurate round-trip
+    lines = text.splitlines()
+    return lines, ending
+
+
+def write_text_lines(path: Path, lines: List[str], ending: str) -> None:
+    """Write lines to a file using the specified line ending."""
+    content = ending.join(lines) + ending
+    path.write_bytes(content.encode("utf-8"))
 
 
 def ensure_safe_name(name: str) -> str:
@@ -136,58 +154,112 @@ def ensure_safe_name(name: str) -> str:
     cleaned = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")
     if not cleaned:
         raise ValueError("Invalid icon name after sanitization.")
+    if not cleaned[0].isalpha():
+        raise ValueError(
+            f"Invalid icon name '{cleaned}': must start with a letter."
+        )
     return cleaned
 
 
-def append_unique_lines_to_xml(target_file: Path, new_lines: List[str], closing_tag: str) -> None:
-    """Append new lines right before the closing XML tag, avoiding duplicates."""
-    lines = load_text_lines(target_file)
-    existing_set = {l.strip() for l in lines if l.strip()}
-    filtered_additions = [l for l in new_lines if l.strip() not in existing_set]
+def append_lines_to_xml(
+    target_file: Path,
+    new_lines: List[str],
+    closing_tag: str,
+    insert_after: Optional[str] = None,
+) -> None:
+    """Append new lines before the closing XML tag, avoiding duplicates.
 
-    if not filtered_additions:
+    Args:
+        target_file: Path to the XML file to update.
+        new_lines: Lines to append.
+        closing_tag: The closing tag to find (e.g. '</resources>').
+        insert_after: Optional marker line; insert right after this line instead
+            of before closing_tag. Useful for drawable.xml category insertion.
+    """
+    if not target_file.exists():
+        raise FileNotFoundError(
+            f"Target XML not found: {target_file}. "
+            "Check --repo-root points to the correct Cuscon repo."
+        )
+
+    lines, ending = load_text_lines(target_file)
+    existing_set = {l.strip() for l in lines if l.strip()}
+    filtered = [l for l in new_lines if l.strip() not in existing_set]
+
+    if not filtered:
         return
 
     insert_idx = len(lines)
-    for i, l in enumerate(lines):
-        if l.strip() == closing_tag:
-            insert_idx = i
-            break
+    if insert_after:
+        for i, l in enumerate(lines):
+            if insert_after in l:
+                insert_idx = i + 1
+                break
+        if insert_idx == len(lines):
+            # Fallback: insert before closing_tag, skipping trailing blank lines
+            for i, l in enumerate(lines):
+                if closing_tag in l.strip():
+                    insert_idx = i
+                    while insert_idx > 0 and not lines[insert_idx - 1].strip():
+                        insert_idx -= 1
+                    break
+    else:
+        for i, l in enumerate(lines):
+            if closing_tag in l.strip():
+                # Insert before the closing tag, but also skip any trailing blank lines
+                insert_idx = i
+                while insert_idx > 0 and not lines[insert_idx - 1].strip():
+                    insert_idx -= 1
+                break
 
-    output_lines = lines[:insert_idx] + filtered_additions + lines[insert_idx:]
-    target_file.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+    # Normalize indentation to tab to match repo style, but preserve blank lines
+    normalized = []
+    for l in filtered:
+        stripped = l.strip()
+        # Keep blank lines as-is, normalize only actual XML elements
+        if not stripped:
+            normalized.append(l)
+        elif stripped.startswith("<item") or stripped.startswith("<AppIcon"):
+            # Normalize to tab + content
+            normalized.append("\t" + stripped)
+        else:
+            normalized.append(l)
+
+    output = lines[:insert_idx] + normalized + lines[insert_idx:]
+    write_text_lines(target_file, output, ending)
 
 
-
-def extract_request_xml_blocks(lines: List[str], attr_name: str) -> Tuple[Dict[str, List[str]], Dict[str, Set[str]]]:
-    """Extract XML lines (with preceding comments) grouped by drawable stem name."""
+def extract_request_xml_blocks(
+    lines: List[str], attr_name: str
+) -> Tuple[Dict[str, List[str]], Dict[str, Set[str]]]:
+    """Extract XML lines grouped by drawable/name, without comments."""
     lines_map: Dict[str, List[str]] = {}
     components_map: Dict[str, Set[str]] = {}
-    pending_comments: List[str] = []
 
-    pattern = re.compile(rf'{attr_name}="([^"]+)"')
+    drawable_pattern = re.compile(rf'{attr_name}="([^"]+)"')
     comp_pattern = re.compile(r'component="([^"]+)"')
+    # Also capture name="pkg/activity" from theme AppIcon entries
+    name_pattern = re.compile(r'name="([^"]+)"')
 
     for line in lines:
         stripped = line.strip()
+        # Skip comment lines — they are not copied into the app XMLs
         if stripped.startswith("<!--") and stripped.endswith("-->"):
-            pending_comments.append(line)
             continue
 
-        match = pattern.search(line)
+        match = drawable_pattern.search(line)
         if match:
-            drawable = match.group(1)
-            block = pending_comments + [line]
-            lines_map.setdefault(drawable, []).extend(block)
-            pending_comments = []
+            key = match.group(1)
+            lines_map.setdefault(key, []).append(line)
 
+            # Extract component= for appfilter, name= for theme
             comp_match = comp_pattern.search(line)
             if comp_match:
-                components_map.setdefault(drawable, set()).add(comp_match.group(1))
-            continue
-
-        if stripped and not (stripped.startswith("<resources") or stripped.startswith("</resources") or stripped.startswith("<Theme") or stripped.startswith("</Theme")):
-            pending_comments = []
+                components_map.setdefault(key, set()).add(comp_match.group(1))
+            else:
+                name_match = name_pattern.search(line)
+                if name_match:
+                    components_map.setdefault(key, set()).add(name_match.group(1))
 
     return lines_map, components_map
 
@@ -197,13 +269,22 @@ def scan_request_items(request_dir: Path) -> Dict[str, RequestItem]:
     request_files: Dict[str, List[Path]] = {}
     for child in sorted(request_dir.iterdir()):
         if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
-            request_files.setdefault(child.stem, []).append(child)
+            try:
+                name = ensure_safe_name(child.stem)
+                request_files.setdefault(name, []).append(child)
+            except ValueError as exc:
+                print(f"Warning: Skipping {child.name}: {exc}")
+                continue
 
-    appfilter_lines = load_text_lines(request_dir / "appfilter.xml")
-    theme_lines = load_text_lines(request_dir / "theme_resources.xml")
+    appfilter_lines, _ = load_text_lines(request_dir / "appfilter.xml")
+    theme_lines, _ = load_text_lines(request_dir / "theme_resources.xml")
 
     appfilter_map, components_map = extract_request_xml_blocks(appfilter_lines, "drawable")
-    theme_map, _ = extract_request_xml_blocks(theme_lines, "image")
+    theme_map, theme_components = extract_request_xml_blocks(theme_lines, "image")
+
+    # Merge theme components into the main components map
+    for name, comps in theme_components.items():
+        components_map.setdefault(name, set()).update(comps)
 
     all_drawables = set(request_files.keys()) | set(appfilter_map.keys()) | set(theme_map.keys())
 
@@ -227,7 +308,9 @@ def scan_request_items(request_dir: Path) -> Dict[str, RequestItem]:
     return items
 
 
-def load_existing_app_data(repo_root: Path) -> Tuple[Set[str], Set[str]]:
+def load_existing_app_data(
+    repo_root: Path,
+) -> Tuple[Set[str], Set[str]]:
     """Extract existing drawable names and component signatures from the app."""
     drawable_dir = repo_root / "app" / "src" / "main" / "res" / "drawable-nodpi"
     existing_drawables: Set[str] = set()
@@ -236,15 +319,27 @@ def load_existing_app_data(repo_root: Path) -> Tuple[Set[str], Set[str]]:
             if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS:
                 existing_drawables.add(item.stem)
 
-    appfilter_path = repo_root / "app" / "src" / "main" / "res" / "xml" / "appfilter.xml"
     existing_components: Set[str] = set()
+    appfilter_path = repo_root / "app" / "src" / "main" / "res" / "xml" / "appfilter.xml"
     if appfilter_path.exists():
-        lines = load_text_lines(appfilter_path)
+        lines, _ = load_text_lines(appfilter_path)
         comp_pattern = re.compile(r'component="([^"]+)"')
         for line in lines:
             m = comp_pattern.search(line)
             if m:
                 existing_components.add(m.group(1))
+
+    # Also extract components from theme_resources.xml AppIcon name= attributes
+    theme_path = repo_root / "app" / "src" / "main" / "res" / "xml" / "theme_resources.xml"
+    if theme_path.exists():
+        lines, _ = load_text_lines(theme_path)
+        name_pattern = re.compile(r'name="([^"]+)"')
+        for line in lines:
+            # Only extract name= from AppIcon elements, not from other elements like Label, ThemePreview, etc.
+            if "<AppIcon" in line:
+                m = name_pattern.search(line)
+                if m:
+                    existing_components.add(m.group(1))
 
     return existing_drawables, existing_components
 
@@ -264,14 +359,15 @@ def classify_items(
 
     for item in items.values():
         is_already_added = bool(item.components and item.components.issubset(existing_components))
-        is_conflict = item.name in existing_drawables and not is_already_added
 
         if is_already_added:
             summary[RequestStatus.ALREADY_ADDED].append(item)
-        elif is_conflict:
-            summary[RequestStatus.CONFLICT].append(item)
         elif not item.has_metadata():
+            # No XML metadata — either missing metadata or just a stray image
             summary[RequestStatus.MISSING_METADATA].append(item)
+        elif item.name in existing_drawables:
+            # Has metadata but drawable already exists → conflict
+            summary[RequestStatus.CONFLICT].append(item)
         else:
             summary[RequestStatus.NEW].append(item)
 
@@ -279,20 +375,20 @@ def classify_items(
 
 
 def print_status(summary: Dict[RequestStatus, List[RequestItem]]) -> None:
-    """Display summary of request items with clear, beginner-friendly descriptions."""
+    """Display summary of request items."""
     descriptions = {
         RequestStatus.NEW: "Brand-new icons ready to be added to Cuscon (image file + XML metadata).",
         RequestStatus.ALREADY_ADDED: "App components that are ALREADY registered in Cuscon (nothing to do).",
-        RequestStatus.CONFLICT: "Icons that ALREADY exist in Cuscon, but a user requested a new activity/package for them.",
-        RequestStatus.MISSING_METADATA: "Image files in the request folder that have no XML configuration lines.",
+        RequestStatus.CONFLICT: "Icons that ALREADY exist in Cuscon, but a new activity/package was requested.",
+        RequestStatus.MISSING_METADATA: "Image files with no XML configuration lines.",
     }
 
     def print_section(status: RequestStatus, title: str) -> None:
         group = summary[status]
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f" {title.upper()} ({len(group)} items)")
         print(f" Description: {descriptions[status]}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         if not group:
             print("  (none)")
             return
@@ -312,9 +408,10 @@ def interactive_resolve(
     conflicts: List[RequestItem],
     repo_root: Path,
     request_dir: Path,
+    existing_drawables: Set[str],
     dry_run: bool,
 ) -> None:
-    """Interactively resolve filename conflicts with clear prompts."""
+    """Interactively resolve filename conflicts."""
     if not conflicts:
         print("\nNo conflicts found.")
         return
@@ -322,13 +419,17 @@ def interactive_resolve(
     appfilter_path = request_dir / "appfilter.xml"
     theme_path = request_dir / "theme_resources.xml"
 
-    appfilter_lines = load_text_lines(appfilter_path)
-    theme_lines = load_text_lines(theme_path)
+    appfilter_lines, appfilter_ending = load_text_lines(appfilter_path)
+    theme_lines, theme_ending = load_text_lines(theme_path)
 
     target_appfilter = repo_root / "app" / "src" / "main" / "res" / "xml" / "appfilter.xml"
     target_theme = repo_root / "app" / "src" / "main" / "res" / "xml" / "theme_resources.xml"
 
-    existing_drawables, _ = load_existing_app_data(repo_root)
+    if not target_appfilter.exists():
+        raise FileNotFoundError(f"Target appfilter.xml not found: {target_appfilter}")
+    if not target_theme.exists():
+        raise FileNotFoundError(f"Target theme_resources.xml not found: {target_theme}")
+
     modified = False
 
     print("\n" + "=" * 70)
@@ -352,61 +453,76 @@ def interactive_resolve(
         print("  [s]kip   : Leave untouched and skip to next item.")
 
         action = ""
-        while action not in ("l", "d", "r", "s", "k"):
+        while action not in ("l", "d", "r", "s"):
             try:
                 action = input("\nChoose action ([l]ink / [d]elete / [r]ename / [s]kip): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting resolution.")
                 return
 
-        if action in ("s", "k"):
+        if action == "s":
             print("Skipped.")
             continue
 
         if action == "l":
             print(f"Linking component(s) to existing '{item.name}' icon...")
             if not dry_run:
-                # Append appfilter and theme lines to main app XMLs
-                if item.appfilter_lines and target_appfilter.exists():
-                    append_unique_lines_to_xml(target_appfilter, item.appfilter_lines, "</resources>")
-                if item.theme_lines and target_theme.exists():
-                    append_unique_lines_to_xml(target_theme, item.theme_lines, "</Theme>")
+                if item.appfilter_lines:
+                    append_lines_to_xml(target_appfilter, item.appfilter_lines, "</resources>")
+                if item.theme_lines:
+                    append_lines_to_xml(target_theme, item.theme_lines, "</Theme>")
 
-                # Delete duplicate request image files
-                files_to_delete = [item.file_path] + item.duplicate_files
-                for f in files_to_delete:
+                # Delete request image files
+                for f in [item.file_path] + item.duplicate_files:
                     if f.exists():
                         f.unlink()
+                        print(f"  Deleted: {f.name}")
 
-            pattern_app = re.compile(rf'drawable="{re.escape(item.name)}"')
-            pattern_theme = re.compile(rf'image="{re.escape(item.name)}"')
-            appfilter_lines = [line for line in appfilter_lines if not pattern_app.search(line)]
-            theme_lines = [line for line in theme_lines if not pattern_theme.search(line)]
+            # Remove matching lines from request XMLs
+            appfilter_lines = [
+                l for l in appfilter_lines
+                if f'drawable="{item.name}"' not in l
+            ]
+            theme_lines = [
+                l for l in theme_lines
+                if f'image="{item.name}"' not in l
+            ]
             modified = True
-            print(f"Linked '{item.name}' component to existing icon and removed request image.")
+            if dry_run:
+                print(f"  [dry-run] Would link '{item.name}' and remove request image.")
+            else:
+                print(f"Linked '{item.name}' component to existing icon and removed request image.")
             continue
 
         if action == "d":
-            files_to_delete = [item.file_path] + item.duplicate_files
-            for f in files_to_delete:
-                if f.exists():
-                    if dry_run:
-                        print(f"Would delete: {f}")
-                    else:
-                        print(f"Deleting: {f}")
+            if not dry_run:
+                for f in [item.file_path] + item.duplicate_files:
+                    if f.exists():
+                        print(f"  Deleting: {f.name}")
                         f.unlink()
+            else:
+                for f in [item.file_path] + item.duplicate_files:
+                    print(f"  [dry-run] Would delete: {f.name}")
 
-            pattern_app = re.compile(rf'drawable="{re.escape(item.name)}"')
-            pattern_theme = re.compile(rf'image="{re.escape(item.name)}"')
-            appfilter_lines = [line for line in appfilter_lines if not pattern_app.search(line)]
-            theme_lines = [line for line in theme_lines if not pattern_theme.search(line)]
+            appfilter_lines = [
+                l for l in appfilter_lines
+                if f'drawable="{item.name}"' not in l
+            ]
+            theme_lines = [
+                l for l in theme_lines
+                if f'image="{item.name}"' not in l
+            ]
             modified = True
             continue
 
         if action == "r":
             new_name = ""
             while not new_name:
-                candidate = input("New drawable name: ").strip()
+                try:
+                    candidate = input("New drawable name: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nExiting resolution.")
+                    return
                 try:
                     candidate = ensure_safe_name(candidate)
                 except ValueError as exc:
@@ -419,33 +535,55 @@ def interactive_resolve(
                 if candidate in existing_drawables:
                     print(f"Name '{candidate}' already exists in app drawables. Pick another.")
                     continue
+                # Check no intra-request collision
+                if any(candidate == other.name for other in conflicts if other is not item):
+                    print(f"Name '{candidate}' collides with another conflict item. Pick another.")
+                    continue
                 new_name = candidate
 
             ext = item.file_path.suffix
             new_file_path = item.file_path.with_name(new_name + ext)
 
             if dry_run:
-                print(f"Would rename {item.file_path.name} -> {new_file_path.name}")
+                print(f"  [dry-run] Would rename {item.file_path.name} -> {new_file_path.name}")
             else:
-                print(f"Renaming {item.file_path.name} -> {new_file_path.name}")
                 if item.file_path.exists():
-                    item.file_path.rename(new_file_path)
+                    if new_file_path.exists():
+                        print(f"  Warning: {new_file_path.name} already exists, skipping rename.")
+                    else:
+                        item.file_path.rename(new_file_path)
+                        print(f"  Renamed {item.file_path.name} -> {new_file_path.name}")
+                # Also rename duplicate files
+                new_duplicates = []
+                for dup in item.duplicate_files:
+                    new_dup = dup.with_name(new_name + dup.suffix)
+                    if dup.exists():
+                        if new_dup.exists():
+                            print(f"  Warning: {new_dup.name} already exists, skipping duplicate rename.")
+                        else:
+                            dup.rename(new_dup)
+                            new_duplicates.append(new_dup)
+                item.duplicate_files = new_duplicates
 
-            app_sub = re.compile(rf'(drawable="){re.escape(item.name)}(")')
-            theme_sub = re.compile(rf'(image="){re.escape(item.name)}(")')
-
-            appfilter_lines = [app_sub.sub(rf'\1{new_name}\2', l) for l in appfilter_lines]
-            theme_lines = [theme_sub.sub(rf'\1{new_name}\2', l) for l in theme_lines]
+            # Rewrite XML references
+            appfilter_lines = [
+                l.replace(f'drawable="{item.name}"', f'drawable="{new_name}"')
+                for l in appfilter_lines
+            ]
+            theme_lines = [
+                l.replace(f'image="{item.name}"', f'image="{new_name}"')
+                for l in theme_lines
+            ]
             modified = True
 
     if modified:
         if dry_run:
-            print("\nDry-run: Request XML files would be updated.")
+            print("\n[dry-run] Request XML files would be updated.")
         else:
             if appfilter_path.exists():
-                appfilter_path.write_text("\n".join(appfilter_lines) + "\n", encoding="utf-8")
+                write_text_lines(appfilter_path, appfilter_lines, appfilter_ending)
             if theme_path.exists():
-                theme_path.write_text("\n".join(theme_lines) + "\n", encoding="utf-8")
+                write_text_lines(theme_path, theme_lines, theme_ending)
             print("\nUpdated request metadata XML files.")
 
 
@@ -460,18 +598,18 @@ def apply_requests(new_items: List[RequestItem], repo_root: Path, dry_run: bool)
     target_theme = repo_root / "app" / "src" / "main" / "res" / "xml" / "theme_resources.xml"
     target_drawable_dir = repo_root / "app" / "src" / "main" / "res" / "drawable-nodpi"
 
-    existing_appfilter_lines = load_text_lines(target_appfilter)
-    existing_drawable_lines = load_text_lines(target_drawable_xml)
-    existing_theme_lines = load_text_lines(target_theme)
+    # Validate all target files exist before making any changes
+    for name, path in [("appfilter.xml", target_appfilter), ("drawable.xml", target_drawable_xml), ("theme_resources.xml", target_theme)]:
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Target XML not found: {path}. "
+                "Check --repo-root points to the correct Cuscon repo."
+            )
 
-    existing_appfilter_set = {l.strip() for l in existing_appfilter_lines if l.strip()}
-    existing_drawable_set = {l.strip() for l in existing_drawable_lines if l.strip()}
-    existing_theme_set = {l.strip() for l in existing_theme_lines if l.strip()}
-
+    file_copies: List[Tuple[Path, Path]] = []
     appfilter_additions: List[str] = []
     drawable_additions: List[str] = []
     theme_additions: List[str] = []
-    file_copies: List[Tuple[Path, Path]] = []
 
     for item in new_items:
         if not item.file_path.exists():
@@ -481,20 +619,9 @@ def apply_requests(new_items: List[RequestItem], repo_root: Path, dry_run: bool)
         dest_file = target_drawable_dir / item.file_path.name
         file_copies.append((item.file_path, dest_file))
 
-        for line in item.appfilter_lines:
-            if line.strip() not in existing_appfilter_set:
-                appfilter_additions.append(line)
-                existing_appfilter_set.add(line.strip())
-
-        item_drawable_tag = f'    <item drawable="{item.name}" />'
-        if item_drawable_tag.strip() not in existing_drawable_set:
-            drawable_additions.append(item_drawable_tag)
-            existing_drawable_set.add(item_drawable_tag.strip())
-
-        for line in item.theme_lines:
-            if line.strip() not in existing_theme_set:
-                theme_additions.append(line)
-                existing_theme_set.add(line.strip())
+        appfilter_additions.extend(item.appfilter_lines)
+        drawable_additions.append(f'\t<item drawable="{item.name}" />')
+        theme_additions.extend(item.theme_lines)
 
     if dry_run:
         print("Dry-run mode: Planned actions:")
@@ -506,6 +633,7 @@ def apply_requests(new_items: List[RequestItem], repo_root: Path, dry_run: bool)
         print(f"  Theme_resources.xml lines to append: {len(theme_additions)}")
         return
 
+    # Perform all copies first
     target_drawable_dir.mkdir(parents=True, exist_ok=True)
     copied_count = 0
     for src, dst in file_copies:
@@ -514,48 +642,22 @@ def apply_requests(new_items: List[RequestItem], repo_root: Path, dry_run: bool)
             copied_count += 1
     print(f"Copied {copied_count} icon files into {target_drawable_dir}.")
 
-    # Append to appfilter.xml
-    if appfilter_additions and target_appfilter.exists():
-        lines = load_text_lines(target_appfilter)
-        insert_idx = len(lines)
-        for i, l in enumerate(lines):
-            if l.strip() == "</resources>":
-                insert_idx = i
-                break
-        new_lines = lines[:insert_idx] + [""] + appfilter_additions + lines[insert_idx:]
-        target_appfilter.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    # Append to XMLs using the consolidated helper
+    if appfilter_additions:
+        append_lines_to_xml(target_appfilter, appfilter_additions, "</resources>")
         print(f"Appended {len(appfilter_additions)} lines to appfilter.xml.")
 
-    # Append to drawable.xml under <category title="New Icons" /> or before </resources>
-    if drawable_additions and target_drawable_xml.exists():
-        lines = load_text_lines(target_drawable_xml)
-        insert_idx = -1
-        for i, l in enumerate(lines):
-            if '<category title="New Icons"' in l:
-                insert_idx = i + 1
-                break
-        if insert_idx == -1:
-            for i, l in enumerate(lines):
-                if l.strip() == "</resources>":
-                    insert_idx = i
-                    break
-        if insert_idx == -1:
-            insert_idx = len(lines)
-
-        new_lines = lines[:insert_idx] + drawable_additions + lines[insert_idx:]
-        target_drawable_xml.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    if drawable_additions:
+        append_lines_to_xml(
+            target_drawable_xml,
+            drawable_additions,
+            "</resources>",
+            insert_after='<category title="New Icons"',
+        )
         print(f"Appended {len(drawable_additions)} lines to drawable.xml.")
 
-    # Append to theme_resources.xml
-    if theme_additions and target_theme.exists():
-        lines = load_text_lines(target_theme)
-        insert_idx = len(lines)
-        for i, l in enumerate(lines):
-            if l.strip() == "</Theme>":
-                insert_idx = i
-                break
-        new_lines = lines[:insert_idx] + [""] + theme_additions + lines[insert_idx:]
-        target_theme.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    if theme_additions:
+        append_lines_to_xml(target_theme, theme_additions, "</Theme>")
         print(f"Appended {len(theme_additions)} lines to theme_resources.xml.")
 
 
@@ -583,7 +685,13 @@ def main() -> int:
     if args.command == "status":
         print_status(summary)
     elif args.command == "resolve":
-        interactive_resolve(summary[RequestStatus.CONFLICT], repo_root, request_dir, args.dry_run)
+        interactive_resolve(
+            summary[RequestStatus.CONFLICT],
+            repo_root,
+            request_dir,
+            existing_drawables,
+            args.dry_run,
+        )
     elif args.command == "apply":
         apply_requests(summary[RequestStatus.NEW], repo_root, args.dry_run)
 
